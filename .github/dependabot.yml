@@ -6,6 +6,8 @@ updates:
       - "/d2"
     schedule:
       interval: "daily"
+    cooldown:
+      default-days: 0
     groups:
       hosted-boundary-probe:
         patterns:
