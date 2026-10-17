@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: "gitsubmodule"
+    directories:
+      - "/"
+      - "/d2"
+    schedule:
+      interval: "daily"
+    groups:
+      hosted-boundary-probe:
+        patterns:
+          - "*"
