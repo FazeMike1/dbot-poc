@@ -1,0 +1,3 @@
+[submodule "a"]
+	path = subA
+	url = https://github.com/FazeMike1/dbot-sub.git
